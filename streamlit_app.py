@@ -89,68 +89,170 @@ def table_exists(schema: str, table: str) -> bool:
         return not df.empty
     except Exception:
         return False
+# ---- Schema helpers ----
+@st.cache_data(ttl=300)
+def get_table_columns(schema: str, table: str):
+    from athena import read_sql
+    q = f"""
+    SELECT column_name
+    FROM information_schema.columns
+    WHERE table_schema = '{schema}'
+      AND table_name = '{table}'
+    ORDER BY ordinal_position
+    """
+    try:
+        df = read_sql(q)
+        return set(df["column_name"].str.lower().tolist())
+    except Exception:
+        return set()
+
+def plays_time_expr(cols: set):
+    # Decide which timestamp/date column to use for daily grouping
+    # and dedupe key.
+    if "played_at" in cols:
+        return "played_at"
+    if "played_at_ts" in cols:
+        return "played_at_ts"
+    # Fallback: no explicit timestamp, use partition/date column
+    return "dt"
+
+@st.cache_data(ttl=300)
+def plays_cols():
+    return get_table_columns(SCHEMA, "stg_spotify__plays")
 
 @st.cache_data(ttl=300)
 def load_kpis(start_date, end_date):
     s, e = str(start_date), str(end_date)
-    sql = f"""
-   WITH dedup AS (
-  SELECT DISTINCT played_at, track_id
-  FROM {SCHEMA}.stg_spotify__plays
-  WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
-),
-daily AS (
-  SELECT CAST(date(played_at) AS date) AS dt,
-         COUNT(*) AS plays,
-         COUNT(DISTINCT track_id) AS unique_tracks
-  FROM dedup GROUP BY 1
-),
-totals AS (
-  SELECT SUM(plays) AS total_plays,
-         SUM(unique_tracks) AS total_unique_tracks,
-         AVG(plays) AS avg_plays_per_day,
-         COUNT(*) AS active_days
-  FROM daily
-)
-SELECT * FROM totals
-    """
+    cols = plays_cols()
+    time_col = plays_time_expr(cols)
+
+    if time_col in ("played_at", "played_at_ts"):
+        # Use timestamp column for dedupe and daily grouping
+        sql = f"""
+        WITH dedup AS (
+          SELECT DISTINCT {time_col}, track_id
+          FROM {SCHEMA}.stg_spotify__plays
+          WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
+        ),
+        daily AS (
+          SELECT CAST(date({time_col}) AS date) AS dt,
+                 COUNT(*) AS plays,
+                 COUNT(DISTINCT track_id) AS unique_tracks
+          FROM dedup GROUP BY 1
+        ),
+        totals AS (
+          SELECT
+            SUM(plays) AS total_plays,
+            SUM(unique_tracks) AS total_unique_tracks,
+            AVG(plays) AS avg_plays_per_day,
+            COUNT(*) AS active_days
+          FROM daily
+        )
+        SELECT * FROM totals
+        """
+    else:
+        # No timestamp column → dedupe and group by dt (partition/date)
+        sql = f"""
+        WITH dedup AS (
+          SELECT DISTINCT dt, track_id
+          FROM {SCHEMA}.stg_spotify__plays
+          WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
+        ),
+        daily AS (
+          SELECT CAST(dt AS date) AS dt,
+                 COUNT(*) AS plays,
+                 COUNT(DISTINCT track_id) AS unique_tracks
+          FROM dedup GROUP BY 1
+        ),
+        totals AS (
+          SELECT
+            SUM(plays) AS total_plays,
+            SUM(unique_tracks) AS total_unique_tracks,
+            AVG(plays) AS avg_plays_per_day,
+            COUNT(*) AS active_days
+          FROM daily
+        )
+        SELECT * FROM totals
+        """
     return read_sql(sql)
 
 
 @st.cache_data(ttl=300)
 def load_daily_series(start_date, end_date):
     s, e = str(start_date), str(end_date)
-    sql = f"""
-   WITH dedup AS (
-  SELECT DISTINCT played_at, track_id
-  FROM {SCHEMA}.stg_spotify__plays
-  WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
-)
-SELECT CAST(date(played_at) AS date) AS dt,
-       COUNT(*) AS plays,
-       COUNT(DISTINCT track_id) AS unique_tracks
-FROM dedup
-GROUP BY 1
-ORDER BY 1
-    """
+    cols = plays_cols()
+    time_col = plays_time_expr(cols)
+
+    if time_col in ("played_at", "played_at_ts"):
+        sql = f"""
+        WITH dedup AS (
+          SELECT DISTINCT {time_col}, track_id
+          FROM {SCHEMA}.stg_spotify__plays
+          WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
+        )
+        SELECT CAST(date({time_col}) AS date) AS dt,
+               COUNT(*) AS plays,
+               COUNT(DISTINCT track_id) AS unique_tracks
+        FROM dedup
+        GROUP BY 1
+        ORDER BY 1
+        """
+    else:
+        sql = f"""
+        WITH dedup AS (
+          SELECT DISTINCT dt, track_id
+          FROM {SCHEMA}.stg_spotify__plays
+          WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
+        )
+        SELECT CAST(dt AS date) AS dt,
+               COUNT(*) AS plays,
+               COUNT(DISTINCT track_id) AS unique_tracks
+        FROM dedup
+        GROUP BY 1
+        ORDER BY 1
+        """
     return read_sql(sql)
+
 
 @st.cache_data(ttl=300)
 def load_top_tracks(start_date, end_date, limit=15):
     s, e = str(start_date), str(end_date)
-    try:
-        sql_join = f"""
+    cols = plays_cols()
+    time_col = plays_time_expr(cols)
+
+    # Build a dedup CTE that matches available columns
+    if time_col in ("played_at", "played_at_ts"):
+        dedup_cte = f"""
         WITH dedup AS (
-          SELECT DISTINCT played_at, track_id
+          SELECT DISTINCT {time_col}, track_id
           FROM {SCHEMA}.stg_spotify__plays
           WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
         )
-        SELECT d.track_id,
-               COALESCE(t.track_name, d.track_id) AS track_name,
+        """
+        src = "dedup d"
+        src_key = "d.track_id"
+    else:
+        dedup_cte = f"""
+        WITH dedup AS (
+          SELECT DISTINCT dt, track_id
+          FROM {SCHEMA}.stg_spotify__plays
+          WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
+        )
+        """
+        src = "dedup d"
+        src_key = "d.track_id"
+
+    # Try join to dim_tracks if present; else fallback
+    try:
+        # We won’t call information_schema for dim here; just try-then-fallback
+        sql_join = f"""
+        {dedup_cte}
+        SELECT {src_key} AS track_id,
+               COALESCE(t.track_name, {src_key}) AS track_name,
                COUNT(*) AS play_count
-        FROM dedup d
+        FROM {src}
         LEFT JOIN {SCHEMA}.dim_tracks t
-          ON d.track_id = t.track_id
+          ON {src_key} = t.track_id
         GROUP BY 1,2
         ORDER BY play_count DESC
         LIMIT {int(limit)}
@@ -162,30 +264,24 @@ def load_top_tracks(start_date, end_date, limit=15):
         pass
 
     sql_simple = f"""
-    WITH dedup AS (
-      SELECT DISTINCT played_at, track_id
-      FROM {SCHEMA}.stg_spotify__plays
-      WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
-    )
-    SELECT track_id,
-           track_id AS track_name,
+    {dedup_cte}
+    SELECT {src_key} AS track_id,
+           {src_key} AS track_name,
            COUNT(*) AS play_count
-    FROM dedup
+    FROM {src}
     GROUP BY 1,2
     ORDER BY play_count DESC
     LIMIT {int(limit)}
     """
     return read_sql(sql_simple)
 
+
 @st.cache_data(ttl=300)
 def load_sessions(start_date, end_date):
     s, e = str(start_date), str(end_date)
-    has_fct = table_exists(SCHEMA, "fct_listening_sessions")
-
-    if not has_fct:
-        # return empty frame with expected columns
+    # Only query if fact table exists
+    if not table_exists(SCHEMA, "fct_listening_sessions"):
         return pd.DataFrame(columns=["session_id","session_start","session_end","track_plays","session_duration_seconds"])
-
     sql = f"""
     SELECT session_id, session_start, session_end, track_plays, session_duration_seconds
     FROM {SCHEMA}.fct_listening_sessions
@@ -194,6 +290,7 @@ def load_sessions(start_date, end_date):
     LIMIT 1000
     """
     return read_sql(sql)
+
 
 # KPI tiles
 kpis = load_kpis(start, end)
