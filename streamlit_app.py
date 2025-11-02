@@ -138,7 +138,8 @@ ORDER BY 1
 @st.cache_data(ttl=300)
 def load_top_tracks(start_date, end_date, limit=15):
     s, e = str(start_date), str(end_date)
-    sql_join = f"""
+    try:
+        sql_join = f"""
         WITH dedup AS (
           SELECT DISTINCT played_at, track_id
           FROM {SCHEMA}.stg_spotify__plays
@@ -159,6 +160,7 @@ def load_top_tracks(start_date, end_date, limit=15):
             return df
     except Exception:
         pass
+
     sql_simple = f"""
     WITH dedup AS (
       SELECT DISTINCT played_at, track_id
@@ -169,18 +171,6 @@ def load_top_tracks(start_date, end_date, limit=15):
            track_id AS track_name,
            COUNT(*) AS play_count
     FROM dedup
-    GROUP BY 1,2
-    ORDER BY play_count DESC
-    LIMIT {int(limit)}
-    """
-    return read_sql(sql_simple)
-
-    sql_simple = f"""
-    SELECT p.track_id,
-           p.track_id AS track_name,
-           COUNT(*) AS play_count
-    FROM {SCHEMA}.stg_spotify__plays p
-    WHERE p.dt BETWEEN DATE '{s}' AND DATE '{e}'
     GROUP BY 1,2
     ORDER BY play_count DESC
     LIMIT {int(limit)}
