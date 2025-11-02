@@ -133,14 +133,19 @@ def load_daily_series(start_date, end_date):
 @st.cache_data(ttl=300)
 def load_top_tracks(start_date, end_date, limit=15):
     s, e = str(start_date), str(end_date)
-    try:
+    
         sql_join = f"""
-        SELECT p.track_id,
-               COALESCE(t.track_name, p.track_id) AS track_name,
+        WITH dedup AS (
+          SELECT DISTINCT played_at, track_id
+          FROM {SCHEMA}.stg_spotify__plays
+          WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
+        )
+        SELECT d.track_id,
+               COALESCE(t.track_name, d.track_id) AS track_name,
                COUNT(*) AS play_count
-        FROM {SCHEMA}.stg_spotify__plays p
-        LEFT JOIN {SCHEMA}.dim_tracks t ON p.track_id = t.track_id
-        WHERE p.dt BETWEEN DATE '{s}' AND DATE '{e}'
+        FROM dedup d
+        LEFT JOIN {SCHEMA}.dim_tracks t
+          ON d.track_id = t.track_id
         GROUP BY 1,2
         ORDER BY play_count DESC
         LIMIT {int(limit)}
@@ -149,9 +154,23 @@ def load_top_tracks(start_date, end_date, limit=15):
         if not df.empty:
             return df
     except Exception:
-        pass  
+        pass
+    sql_simple = f"""
+    WITH dedup AS (
+      SELECT DISTINCT played_at, track_id
+      FROM {SCHEMA}.stg_spotify__plays
+      WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
+    )
+    SELECT track_id,
+           track_id AS track_name,
+           COUNT(*) AS play_count
+    FROM dedup
+    GROUP BY 1,2
+    ORDER BY play_count DESC
+    LIMIT {int(limit)}
+    """
+    return read_sql(sql_simple)
 
-    # 2) Fallback (no dim join — just counts by track_id)
     sql_simple = f"""
     SELECT p.track_id,
            p.track_id AS track_name,
