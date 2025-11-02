@@ -92,8 +92,7 @@ def table_exists(schema: str, table: str) -> bool:
 
 @st.cache_data(ttl=300)
 def load_kpis(start_date, end_date):
-    s = str(start_date)
-    e = str(end_date)
+    s, e = str(start_date), str(end_date)
     sql = f"""
     WITH plays AS (
       SELECT CAST(dt AS date) AS dt, track_id
@@ -111,29 +110,15 @@ def load_kpis(start_date, end_date):
         AVG(plays) AS avg_plays_per_day,
         COUNT(*) AS active_days
       FROM daily
-    ),
-    top_tracks AS (
-      SELECT p.track_id, t.track_name, COUNT(*) AS play_count,
-             ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS rn
-      FROM plays p
-      LEFT JOIN {SCHEMA}.dim_tracks t USING (track_id)
-      GROUP BY 1,2
     )
-    SELECT
-      total_plays,
-      total_unique_tracks,
-      avg_plays_per_day,
-      active_days,
-      (SELECT track_name FROM top_tracks WHERE rn = 1) AS top_track_name,
-      (SELECT play_count FROM top_tracks WHERE rn = 1) AS top_track_plays
-    FROM totals
+    SELECT * FROM totals
     """
     return read_sql(sql)
 
+
 @st.cache_data(ttl=300)
 def load_daily_series(start_date, end_date):
-    s = str(start_date)
-    e = str(end_date)
+    s, e = str(start_date), str(end_date)
     sql = f"""
     SELECT CAST(dt AS date) AS dt,
            COUNT(*) AS plays,
@@ -147,25 +132,44 @@ def load_daily_series(start_date, end_date):
 
 @st.cache_data(ttl=300)
 def load_top_tracks(start_date, end_date, limit=15):
-    s = str(start_date)
-    e = str(end_date)
-    sql = f"""
-    SELECT p.track_id,
-           COALESCE(t.track_name, p.track_id) AS track_name,
-           COUNT(*) AS play_count
-    FROM {SCHEMA}.stg_spotify__plays p
-    LEFT JOIN {SCHEMA}.dim_tracks t USING (track_id)
-    WHERE p.dt BETWEEN DATE '{s}' AND DATE '{e}'
-    GROUP BY 1,2
-    ORDER BY play_count DESC
-    LIMIT {int(limit)}
-    """
+    s, e = str(start_date), str(end_date)
+    has_dim = table_exists(SCHEMA, "dim_tracks")
+
+    if has_dim:
+        sql = f"""
+        SELECT p.track_id,
+               COALESCE(t.track_name, p.track_id) AS track_name,
+               COUNT(*) AS play_count
+        FROM {SCHEMA}.stg_spotify__plays p
+        LEFT JOIN {SCHEMA}.dim_tracks t USING (track_id)
+        WHERE p.dt BETWEEN DATE '{s}' AND DATE '{e}'
+        GROUP BY 1,2
+        ORDER BY play_count DESC
+        LIMIT {int(limit)}
+        """
+    else:
+        sql = f"""
+        SELECT p.track_id,
+               p.track_id AS track_name,
+               COUNT(*) AS play_count
+        FROM {SCHEMA}.stg_spotify__plays p
+        WHERE p.dt BETWEEN DATE '{s}' AND DATE '{e}'
+        GROUP BY 1,2
+        ORDER BY play_count DESC
+        LIMIT {int(limit)}
+        """
     return read_sql(sql)
+
 
 @st.cache_data(ttl=300)
 def load_sessions(start_date, end_date):
-    s = str(start_date)
-    e = str(end_date)
+    s, e = str(start_date), str(end_date)
+    has_fct = table_exists(SCHEMA, "fct_listening_sessions")
+
+    if not has_fct:
+        # return empty frame with expected columns
+        return pd.DataFrame(columns=["session_id","session_start","session_end","track_plays","session_duration_seconds"])
+
     sql = f"""
     SELECT session_id, session_start, session_end, track_plays, session_duration_seconds
     FROM {SCHEMA}.fct_listening_sessions
