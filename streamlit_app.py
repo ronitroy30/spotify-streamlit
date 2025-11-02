@@ -76,78 +76,88 @@ with col_c:
 
 @st.cache_data(ttl=300)
 def load_kpis(start_date, end_date):
+    s = str(start_date)
+    e = str(end_date)
     sql = f"""
-    with plays as (
-      select cast(dt as date) as dt, track_id
-      from {SCHEMA}.stg_spotify__plays
-      where dt between :start and :end
+    WITH plays AS (
+      SELECT CAST(dt AS date) AS dt, track_id
+      FROM {SCHEMA}.stg_spotify__plays
+      WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
     ),
-    daily as (
-      select dt, count(*) as plays, count(distinct track_id) as unique_tracks
-      from plays group by 1
+    daily AS (
+      SELECT dt, COUNT(*) AS plays, COUNT(DISTINCT track_id) AS unique_tracks
+      FROM plays GROUP BY 1
     ),
-    totals as (
-      select
-        sum(plays) as total_plays,
-        sum(unique_tracks) as total_unique_tracks,
-        avg(plays) as avg_plays_per_day,
-        count(*) as active_days
-      from daily
+    totals AS (
+      SELECT
+        SUM(plays) AS total_plays,
+        SUM(unique_tracks) AS total_unique_tracks,
+        AVG(plays) AS avg_plays_per_day,
+        COUNT(*) AS active_days
+      FROM daily
     ),
-    top_tracks as (
-      select p.track_id, t.track_name, count(*) as play_count,
-             row_number() over (order by count(*) desc) as rn
-      from plays p
-      left join {SCHEMA}.dim_tracks t using (track_id)
-      group by 1,2
+    top_tracks AS (
+      SELECT p.track_id, t.track_name, COUNT(*) AS play_count,
+             ROW_NUMBER() OVER (ORDER BY COUNT(*) DESC) AS rn
+      FROM plays p
+      LEFT JOIN {SCHEMA}.dim_tracks t USING (track_id)
+      GROUP BY 1,2
     )
-    select
+    SELECT
       total_plays,
       total_unique_tracks,
       avg_plays_per_day,
       active_days,
-      (select track_name from top_tracks where rn = 1) as top_track_name,
-      (select play_count from top_tracks where rn = 1) as top_track_plays
-    from totals
+      (SELECT track_name FROM top_tracks WHERE rn = 1) AS top_track_name,
+      (SELECT play_count FROM top_tracks WHERE rn = 1) AS top_track_plays
+    FROM totals
     """
-    return read_sql(sql, {"start": str(start_date), "end": str(end_date)})
+    return read_sql(sql)
 
 @st.cache_data(ttl=300)
 def load_daily_series(start_date, end_date):
+    s = str(start_date)
+    e = str(end_date)
     sql = f"""
-    select cast(dt as date) as dt,
-           count(*) as plays,
-           count(distinct track_id) as unique_tracks
-    from {SCHEMA}.stg_spotify__plays
-    where dt between :start and :end
-    group by 1
-    order by 1
+    SELECT CAST(dt AS date) AS dt,
+           COUNT(*) AS plays,
+           COUNT(DISTINCT track_id) AS unique_tracks
+    FROM {SCHEMA}.stg_spotify__plays
+    WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
+    GROUP BY 1
+    ORDER BY 1
     """
-    return read_sql(sql, {"start": str(start_date), "end": str(end_date)})
+    return read_sql(sql)
 
 @st.cache_data(ttl=300)
 def load_top_tracks(start_date, end_date, limit=15):
+    s = str(start_date)
+    e = str(end_date)
     sql = f"""
-    select p.track_id, coalesce(t.track_name, p.track_id) as track_name, count(*) as play_count
-    from {SCHEMA}.stg_spotify__plays p
-    left join {SCHEMA}.dim_tracks t using (track_id)
-    where p.dt between :start and :end
-    group by 1,2
-    order by play_count desc
-    limit {int(limit)}
+    SELECT p.track_id,
+           COALESCE(t.track_name, p.track_id) AS track_name,
+           COUNT(*) AS play_count
+    FROM {SCHEMA}.stg_spotify__plays p
+    LEFT JOIN {SCHEMA}.dim_tracks t USING (track_id)
+    WHERE p.dt BETWEEN DATE '{s}' AND DATE '{e}'
+    GROUP BY 1,2
+    ORDER BY play_count DESC
+    LIMIT {int(limit)}
     """
-    return read_sql(sql, {"start": str(start_date), "end": str(end_date)})
+    return read_sql(sql)
 
 @st.cache_data(ttl=300)
 def load_sessions(start_date, end_date):
+    s = str(start_date)
+    e = str(end_date)
     sql = f"""
-    select session_id, session_start, session_end, track_plays, session_duration_seconds
-    from {SCHEMA}.fct_listening_sessions
-    where date(session_start) between :start and :end
-    order by session_start desc
-    limit 1000
+    SELECT session_id, session_start, session_end, track_plays, session_duration_seconds
+    FROM {SCHEMA}.fct_listening_sessions
+    WHERE DATE(session_start) BETWEEN DATE '{s}' AND DATE '{e}'
+    ORDER BY session_start DESC
+    LIMIT 1000
     """
-    return read_sql(sql, {"start": str(start_date), "end": str(end_date)})
+    return read_sql(sql)
 
 # KPI tiles
 kpis = load_kpis(start, end)
