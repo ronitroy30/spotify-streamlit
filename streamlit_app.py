@@ -5,6 +5,22 @@ import altair as alt
 from dateutil.relativedelta import relativedelta
 from athena import read_sql
 
+@st.cache_data(ttl=300)
+def table_exists(schema: str, table: str) -> bool:
+    from athena import read_sql
+    q = f"""
+    SELECT 1
+    FROM information_schema.tables
+    WHERE table_schema = '{schema}'
+      AND table_name = '{table}'
+    LIMIT 1
+    """
+    try:
+        df = read_sql(q)
+        return not df.empty
+    except Exception:
+        return False
+
 SCHEMA = st.secrets.get("ATHENA_SCHEMA", os.getenv("ATHENA_SCHEMA", "spotify_analytics"))
 
 st.set_page_config(page_title="Spotify Analytics — dbt + Athena", layout="wide")
