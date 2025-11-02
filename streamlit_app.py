@@ -9,6 +9,59 @@ SCHEMA = st.secrets.get("ATHENA_SCHEMA", os.getenv("ATHENA_SCHEMA", "spotify_ana
 
 st.set_page_config(page_title="Spotify Analytics — dbt + Athena", layout="wide")
 st.title("🎧 Spotify Analytics — dbt + Athena")
+import boto3, pandas as pd, streamlit as st
+from sqlalchemy.engine import create_engine
+
+with st.expander("🔧 Live diagnostics (temporary)"):
+    ok = True
+    # 1) STS identity
+    try:
+        region = st.secrets.get("AWS_DEFAULT_REGION", "us-east-1")
+        sts = boto3.client("sts", region_name=region)
+        ident = sts.get_caller_identity()
+        st.success(f"STS OK → Account: {ident['Account']}  |  Arn: {ident['Arn']}")
+    except Exception as e:
+        ok = False; st.error("❌ STS failed (bad/expired keys or wrong region)"); st.exception(e)
+
+    # 2) Athena SELECT current_date (workgroup/output/encryption sanity)
+    if ok:
+        try:
+            workgroup = st.secrets.get("ATHENA_WORKGROUP", "spotify_analytics_wg")
+            stage = st.secrets["ATHENA_S3_STAGING"]  # must end with /
+            conn = (f"awsathena+rest://@athena.{region}.amazonaws.com/"
+                    f"awsdatacatalog?work_group={workgroup}&s3_staging_dir={stage}")
+            eng = create_engine(conn)
+            with eng.connect() as con:
+                df = pd.read_sql("SELECT current_date AS today", con=con)
+            st.success(f"Athena SELECT OK → {df.iloc[0]['today']}")
+        except Exception as e:
+            ok = False; st.error("❌ Athena SELECT failed"); st.exception(e)
+
+    # 3) List tables in your Glue DB/schema
+    if ok:
+        try:
+            schema = st.secrets.get("ATHENA_SCHEMA", "spotify_analytics")
+            with eng.connect() as con:
+                t = pd.read_sql(f"SHOW TABLES IN {schema}", con=con)
+            st.write("Tables in schema:", t)
+            if t.empty:
+                st.warning("Schema has no tables. You must create/crawl/CTAS/dbt them.")
+        except Exception as e:
+            ok = False; st.error("❌ SHOW TABLES failed (wrong schema name or Glue perms)"); st.exception(e)
+
+    # 4) Smoke query against a table you use
+    if ok:
+        try:
+            schema = st.secrets.get("ATHENA_SCHEMA", "spotify_analytics")
+            q = f"SELECT count(*) AS c FROM {schema}.stg_spotify__plays LIMIT 1"
+            with eng.connect() as con:
+                c = pd.read_sql(q, con=con)
+            st.success(f"stg_spotify__plays exists → count sample: {int(c.iloc[0]['c'])}")
+        except Exception as e:
+            st.error("❌ Could not read table stg_spotify__plays")
+            st.info("Likely causes: table doesn’t exist in this schema, no partitions, or wrong region/workgroup.")
+            st.exception(e)
+
 
 # Date pickers
 default_end = dt.date.today()
