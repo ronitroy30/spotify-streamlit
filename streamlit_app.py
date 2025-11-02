@@ -94,24 +94,25 @@ def table_exists(schema: str, table: str) -> bool:
 def load_kpis(start_date, end_date):
     s, e = str(start_date), str(end_date)
     sql = f"""
-    WITH plays AS (
-      SELECT CAST(dt AS date) AS dt, track_id
-      FROM {SCHEMA}.stg_spotify__plays
-      WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
-    ),
-    daily AS (
-      SELECT dt, COUNT(*) AS plays, COUNT(DISTINCT track_id) AS unique_tracks
-      FROM plays GROUP BY 1
-    ),
-    totals AS (
-      SELECT
-        SUM(plays) AS total_plays,
-        SUM(unique_tracks) AS total_unique_tracks,
-        AVG(plays) AS avg_plays_per_day,
-        COUNT(*) AS active_days
-      FROM daily
-    )
-    SELECT * FROM totals
+   WITH dedup AS (
+  SELECT DISTINCT played_at, track_id
+  FROM {SCHEMA}.stg_spotify__plays
+  WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
+),
+daily AS (
+  SELECT CAST(date(played_at) AS date) AS dt,
+         COUNT(*) AS plays,
+         COUNT(DISTINCT track_id) AS unique_tracks
+  FROM dedup GROUP BY 1
+),
+totals AS (
+  SELECT SUM(plays) AS total_plays,
+         SUM(unique_tracks) AS total_unique_tracks,
+         AVG(plays) AS avg_plays_per_day,
+         COUNT(*) AS active_days
+  FROM daily
+)
+SELECT * FROM totals
     """
     return read_sql(sql)
 
@@ -120,21 +121,24 @@ def load_kpis(start_date, end_date):
 def load_daily_series(start_date, end_date):
     s, e = str(start_date), str(end_date)
     sql = f"""
-    SELECT CAST(dt AS date) AS dt,
-           COUNT(*) AS plays,
-           COUNT(DISTINCT track_id) AS unique_tracks
-    FROM {SCHEMA}.stg_spotify__plays
-    WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
-    GROUP BY 1
-    ORDER BY 1
+   WITH dedup AS (
+  SELECT DISTINCT played_at, track_id
+  FROM {SCHEMA}.stg_spotify__plays
+  WHERE dt BETWEEN DATE '{s}' AND DATE '{e}'
+)
+SELECT CAST(date(played_at) AS date) AS dt,
+       COUNT(*) AS plays,
+       COUNT(DISTINCT track_id) AS unique_tracks
+FROM dedup
+GROUP BY 1
+ORDER BY 1
     """
     return read_sql(sql)
 
 @st.cache_data(ttl=300)
 def load_top_tracks(start_date, end_date, limit=15):
     s, e = str(start_date), str(end_date)
-    
-        sql_join = f"""
+    sql_join = f"""
         WITH dedup AS (
           SELECT DISTINCT played_at, track_id
           FROM {SCHEMA}.stg_spotify__plays
@@ -182,8 +186,6 @@ def load_top_tracks(start_date, end_date, limit=15):
     LIMIT {int(limit)}
     """
     return read_sql(sql_simple)
-
-
 
 @st.cache_data(ttl=300)
 def load_sessions(start_date, end_date):
