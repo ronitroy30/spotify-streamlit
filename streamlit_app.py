@@ -24,25 +24,6 @@ with col_c:
 
 dedupe = st.toggle("Dedupe plays (distinct events)", value=True, help="Removes duplicate events before counting")
 
-# ---------- Diagnostics (optional, safe to keep) ----------
-with st.expander("🔧 Diagnostics (click to run)"):
-    try:
-        import boto3
-        region = st.secrets.get("AWS_DEFAULT_REGION", "us-east-1")
-        sts = boto3.client("sts", region_name=region)
-        ident = sts.get_caller_identity()
-        st.success(f"AWS STS OK → Account: {ident['Account']} | Arn: {ident['Arn']}")
-    except Exception as e:
-        st.error("STS failed (bad/expired keys or region mismatch).")
-        st.exception(e)
-
-    try:
-        df = read_sql("SELECT current_date AS today")
-        st.success(f"Athena SELECT OK → {df.iloc[0]['today']}")
-    except Exception as e:
-        st.error("Athena basic SELECT failed.")
-        st.exception(e)
-
 # ---------- Schema helpers ----------
 @st.cache_data(ttl=300)
 def get_table_columns(schema: str, table: str):
