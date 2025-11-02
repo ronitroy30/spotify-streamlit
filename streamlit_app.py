@@ -133,32 +133,37 @@ def load_daily_series(start_date, end_date):
 @st.cache_data(ttl=300)
 def load_top_tracks(start_date, end_date, limit=15):
     s, e = str(start_date), str(end_date)
-    has_dim = table_exists(SCHEMA, "dim_tracks")
-
-    if has_dim:
-        sql = f"""
+    try:
+        sql_join = f"""
         SELECT p.track_id,
                COALESCE(t.track_name, p.track_id) AS track_name,
                COUNT(*) AS play_count
         FROM {SCHEMA}.stg_spotify__plays p
-        LEFT JOIN {SCHEMA}.dim_tracks t USING (track_id)
+        LEFT JOIN {SCHEMA}.dim_tracks t ON p.track_id = t.track_id
         WHERE p.dt BETWEEN DATE '{s}' AND DATE '{e}'
         GROUP BY 1,2
         ORDER BY play_count DESC
         LIMIT {int(limit)}
         """
-    else:
-        sql = f"""
-        SELECT p.track_id,
-               p.track_id AS track_name,
-               COUNT(*) AS play_count
-        FROM {SCHEMA}.stg_spotify__plays p
-        WHERE p.dt BETWEEN DATE '{s}' AND DATE '{e}'
-        GROUP BY 1,2
-        ORDER BY play_count DESC
-        LIMIT {int(limit)}
-        """
-    return read_sql(sql)
+        df = read_sql(sql_join)
+        if not df.empty:
+            return df
+    except Exception:
+        pass  
+
+    # 2) Fallback (no dim join — just counts by track_id)
+    sql_simple = f"""
+    SELECT p.track_id,
+           p.track_id AS track_name,
+           COUNT(*) AS play_count
+    FROM {SCHEMA}.stg_spotify__plays p
+    WHERE p.dt BETWEEN DATE '{s}' AND DATE '{e}'
+    GROUP BY 1,2
+    ORDER BY play_count DESC
+    LIMIT {int(limit)}
+    """
+    return read_sql(sql_simple)
+
 
 
 @st.cache_data(ttl=300)
