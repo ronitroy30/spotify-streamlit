@@ -6,6 +6,234 @@ import altair as alt
 from dateutil.relativedelta import relativedelta
 from athena import read_sql  # uses get_engine() inside athena.py
 
+# ====== LIVE MODE (no AWS) — Spotify OAuth + on-the-fly analytics ======
+import time, base64, urllib.parse, requests
+
+def sp_auth_url():
+    client_id = st.secrets["SPOTIFY_CLIENT_ID"]
+    redirect_uri = st.secrets["SPOTIFY_REDIRECT_URI"]
+    scopes = st.secrets.get("SPOTIFY_SCOPES", "user-read-recently-played")
+    state = str(int(time.time()))
+    params = {
+        "client_id": client_id,
+        "response_type": "code",
+        "redirect_uri": redirect_uri,
+        "scope": scopes,
+        "state": state,
+        "show_dialog": "false",
+    }
+    return "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode(params)
+
+def sp_exchange_code_for_tokens(code: str):
+    token_url = "https://accounts.spotify.com/api/token"
+    client_id = st.secrets["SPOTIFY_CLIENT_ID"]
+    client_secret = st.secrets["SPOTIFY_CLIENT_SECRET"]
+    redirect_uri = st.secrets["SPOTIFY_REDIRECT_URI"]
+    data = {
+        "grant_type": "authorization_code",
+        "code": code,
+        "redirect_uri": redirect_uri,
+    }
+    auth = (client_id, client_secret)
+    r = requests.post(token_url, data=data, auth=auth, timeout=30)
+    r.raise_for_status()
+    return r.json()  # access_token, refresh_token, expires_in, token_type
+
+def sp_refresh_access_token(refresh_token: str):
+    token_url = "https://accounts.spotify.com/api/token"
+    client_id = st.secrets["SPOTIFY_CLIENT_ID"]
+    client_secret = st.secrets["SPOTIFY_CLIENT_SECRET"]
+    data = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+    }
+    auth = (client_id, client_secret)
+    r = requests.post(token_url, data=data, auth=auth, timeout=30)
+    r.raise_for_status()
+    return r.json()
+
+def sp_get_headers(access_token: str):
+    return {"Authorization": f"Bearer {access_token}"}
+
+def sp_fetch_recently_played(access_token: str, limit=50, pages=10):
+    # Pull up to ~500 recent plays
+    items = []
+    url = "https://api.spotify.com/v1/me/player/recently-played"
+    headers = sp_get_headers(access_token)
+    params = {"limit": min(limit, 50)}
+    for _ in range(pages):
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        if r.status_code == 401:
+            raise RuntimeError("Unauthorized—token expired")
+        r.raise_for_status()
+        data = r.json()
+        items.extend(data.get("items", []))
+        next_url = data.get("next")
+        if not next_url:
+            break
+        # Spotify returns full URL for next page
+        url = next_url
+        params = {}
+    return items
+
+def normalize_recently_played(items: list) -> pd.DataFrame:
+    rows = []
+    for it in items:
+        played_at = it.get("played_at")
+        track = it.get("track", {}) or {}
+        aid = (track.get("album") or {}).get("id")
+        aname = (track.get("album") or {}).get("name")
+        t_id = track.get("id")
+        t_name = track.get("name")
+        explicit = track.get("explicit")
+        duration_ms = track.get("duration_ms")
+        # Artists: take first for simplicity
+        artists = track.get("artists") or []
+        if artists:
+            artist_id = artists[0].get("id")
+            artist_name = artists[0].get("name")
+        else:
+            artist_id = None; artist_name = None
+        rows.append({
+            "played_at": played_at,
+            "track_id": t_id,
+            "track_name": t_name,
+            "artist_id": artist_id,
+            "artist_name": artist_name,
+            "album_id": aid,
+            "album_name": aname,
+            "is_explicit": explicit,
+            "duration_ms": duration_ms
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty and "played_at" in df.columns:
+        df["played_at"] = pd.to_datetime(df["played_at"])
+        df["dt"] = df["played_at"].dt.date
+    return df
+
+def live_mode_ui():
+    st.subheader("🔌 Live mode (connect your Spotify)")
+    query_params = st.query_params  # Streamlit Cloud supports this
+    code = query_params.get("code", [None])[0] if isinstance(query_params.get("code"), list) else query_params.get("code")
+
+    if "sp_access_token" not in st.session_state:
+        st.session_state["sp_access_token"] = None
+    if "sp_refresh_token" not in st.session_state:
+        st.session_state["sp_refresh_token"] = None
+    if "sp_token_expiry" not in st.session_state:
+        st.session_state["sp_token_expiry"] = 0
+
+    def need_refresh():
+        return time.time() > st.session_state.get("sp_token_expiry", 0) - 60
+
+    # Handle callback
+    if code and not st.session_state["sp_access_token"]:
+        try:
+            tokens = sp_exchange_code_for_tokens(code)
+            st.session_state["sp_access_token"] = tokens["access_token"]
+            st.session_state["sp_refresh_token"] = tokens.get("refresh_token", st.session_state.get("sp_refresh_token"))
+            st.session_state["sp_token_expiry"] = time.time() + int(tokens.get("expires_in", 3600))
+            st.success("Spotify authorized!")
+            # Clean the URL to remove the code param (nice UX)
+            st.query_params.clear()
+        except Exception as e:
+            st.error("Failed to exchange Spotify code.")
+            st.exception(e)
+
+    col1, col2 = st.columns([1,1])
+    with col1:
+        if not st.session_state["sp_access_token"]:
+            if st.button("Connect Spotify"):
+                st.markdown(f"[Click here to authorize]({sp_auth_url()})")
+        else:
+            st.success("Connected to Spotify")
+
+    with col2:
+        if st.session_state["sp_access_token"]:
+            if st.button("Disconnect"):
+                for k in ["sp_access_token","sp_refresh_token","sp_token_expiry"]:
+                    st.session_state.pop(k, None)
+                st.experimental_rerun()
+
+    # If connected: refresh if needed, fetch recent, and show a quick dashboard
+    if st.session_state["sp_access_token"]:
+        # refresh if needed
+        if need_refresh() and st.session_state.get("sp_refresh_token"):
+            try:
+                rt = sp_refresh_access_token(st.session_state["sp_refresh_token"])
+                st.session_state["sp_access_token"] = rt["access_token"]
+                # Spotify may or may not return a new refresh_token
+                if "refresh_token" in rt:
+                    st.session_state["sp_refresh_token"] = rt["refresh_token"]
+                st.session_state["sp_token_expiry"] = time.time() + int(rt.get("expires_in", 3600))
+            except Exception as e:
+                st.error("Token refresh failed; reconnect required.")
+                st.exception(e)
+                return
+
+        try:
+            with st.spinner("Fetching your recent plays…"):
+                items = sp_fetch_recently_played(st.session_state["sp_access_token"], pages=10)
+                df = normalize_recently_played(items)
+        except Exception as e:
+            st.error("Could not fetch recently played.")
+            st.exception(e)
+            return
+
+        if df.empty:
+            st.info("No recent plays returned by Spotify.")
+            return
+
+        # Date slicer using real timestamps
+        left, right = st.columns(2)
+        min_d = df["played_at"].min().date()
+        max_d = df["played_at"].max().date()
+        with left:
+            s = st.date_input("Start (live)", value=min_d, min_value=min_d, max_value=max_d, key="live_start")
+        with right:
+            e = st.date_input("End (live)", value=max_d, min_value=min_d, max_value=max_d, key="live_end")
+
+        sdf = df[(df["played_at"].dt.date >= s) & (df["played_at"].dt.date <= e)].copy()
+        # Dedupe by (played_at, track_id)
+        sdf = sdf.drop_duplicates(subset=["played_at","track_id"], keep="first")
+
+        # KPIs
+        k1,k2,k3,k4 = st.columns(4)
+        k1.metric("Total Plays", len(sdf))
+        k2.metric("Unique Tracks", sdf["track_id"].nunique())
+        by_day = sdf.groupby(sdf["played_at"].dt.date).size()
+        k3.metric("Avg Plays / Day", round(by_day.mean() if not by_day.empty else 0, 2))
+        k4.metric("Active Days", int(by_day.size))
+
+        # Daily chart
+        trend = by_day.reset_index()
+        trend.columns = ["dt","plays"]
+        chart = alt.Chart(trend).mark_line(point=True).encode(
+            x=alt.X("dt:T", title="Date"),
+            y=alt.Y("plays:Q", title="Plays"),
+            tooltip=["dt:T","plays:Q"]
+        ).properties(height=260, title="Plays per day (live)")
+        st.altair_chart(chart, use_container_width=True)
+
+        # Top tracks (name in response)
+        tops = sdf.groupby(["track_id","track_name"], dropna=False).size().reset_index(name="play_count")
+        tops = tops.sort_values("play_count", ascending=False).head(15)
+        bars = alt.Chart(tops).mark_bar().encode(
+            x=alt.X("play_count:Q", title="Plays"),
+            y=alt.Y("track_name:N", sort="-x", title="Track"),
+            tooltip=["track_name:N","play_count:Q"]
+        ).properties(height=360, title="Top tracks (live)")
+        st.altair_chart(bars, use_container_width=True)
+        st.dataframe(tops, use_container_width=True, hide_index=True)
+
+# ====== Toggle between your AWS-backed dashboard and Live mode ======
+st.divider()
+mode = st.radio("Mode", ["Athena (your warehouse)", "Live mode (user connects Spotify)"], horizontal=True)
+if mode == "Live mode (user connects Spotify)":
+    live_mode_ui()
+    st.stop()
+
+
 # ---------- App config ----------
 SCHEMA = st.secrets.get("ATHENA_SCHEMA", os.getenv("ATHENA_SCHEMA", "spotify_analytics"))
 st.set_page_config(page_title="Spotify Analytics — dbt + Athena", layout="wide")
