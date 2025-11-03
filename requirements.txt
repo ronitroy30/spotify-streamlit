@@ -5,3 +5,4 @@ sqlalchemy==2.*
 pyathena[sqlalchemy]==3.*
 python-dateutil==2.*
 boto3>=1.34,<2
+requests
