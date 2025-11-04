@@ -539,7 +539,7 @@ def live_mode_ui():
 # ============================================================================
 
 def athena_mode_ui():
-    st.subheader("🏗️ Athena (your warehouse via dbt models)")
+    st.subheader("🏗️ My Spotify Analytics")
     if not ATHENA_AVAILABLE:
         st.warning("`athena.py` not found or import failed — Athena mode disabled.")
         return
@@ -552,27 +552,6 @@ def athena_mode_ui():
         start = st.date_input("Start date", value=default_start, key="start_date")
     with col_b:
         end = st.date_input("End date", value=default_end, key="end_date")
-    with col_c:
-        st.info("Athena credentials & settings come from Streamlit Secrets. Data reads your dbt-built tables.", icon="ℹ️")
-    dedupe = st.toggle("Dedupe plays (distinct events)", value=True, help="Removes duplicate events before counting")
-
-    # Diagnostics
-    with st.expander("🔧 Diagnostics (optional)"):
-        try:
-            import boto3
-            region = st.secrets.get("AWS_DEFAULT_REGION", "us-east-1")
-            sts = boto3.client("sts", region_name=region)
-            ident = sts.get_caller_identity()
-            st.success(f"AWS STS OK → Account: {ident['Account']} | Arn: {ident['Arn']}")
-        except Exception as e:
-            st.error("STS failed (bad/expired keys or region mismatch).")
-            st.exception(e)
-        try:
-            df = read_sql("SELECT current_date AS today")
-            st.success(f"Athena SELECT OK → {df.iloc[0]['today']}")
-        except Exception as e:
-            st.error("Athena basic SELECT failed.")
-            st.exception(e)
 
     # Schema helpers
     @st.cache_data(ttl=300)
