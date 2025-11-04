@@ -1,3 +1,4 @@
+
 import os
 import time
 import itertools
@@ -8,25 +9,20 @@ import pandas as pd
 import requests
 import streamlit as st
 import altair as alt
-from dateutil.relativedelta import relativedelta
 
-# ----------------------------- Config -----------------------------
-st.set_page_config(page_title="Spotify Analytics — Demo + Live", layout="wide")
-SCHEMA = st.secrets.get("ATHENA_SCHEMA", os.getenv("ATHENA_SCHEMA", "spotify_analytics"))
+# =========================
+# App config
+# =========================
+st.set_page_config(page_title="Spotify Analytics — Live", layout="wide")
 
 # Local timezone for display and day boundaries
 TZ = "America/New_York"
 def now_local():
     return pd.Timestamp.now(tz=TZ)
 
-# Optional Athena helper (demo mode). App still runs if missing.
-try:
-    from athena import read_sql  # def read_sql(sql, params=None)->pd.DataFrame
-    ATHENA_AVAILABLE = True
-except Exception:
-    ATHENA_AVAILABLE = False
-
-# ----------------------- Spotify OAuth helpers --------------------
+# =========================
+# Spotify OAuth helpers
+# =========================
 def sp_auth_url():
     client_id = st.secrets["SPOTIFY_CLIENT_ID"]
     redirect_uri = st.secrets["SPOTIFY_REDIRECT_URI"]
@@ -58,16 +54,28 @@ def sp_refresh_access_token(refresh_token: str):
     r.raise_for_status()
     return r.json()
 
-def sp_get_headers(access_token: str):
-    return {"Authorization": f"Bearer {access_token}"}
+# =========================
+# Spotify data fetch
+# =========================
+def sp_fetch_recently_played(access_token: str, limit=50, pages=None, days_back: int = 30):
+    """
+    Walks the cursor 'before' to pull deeper history (up to days_back).
+    Spotify caps the endpoint, but this goes far beyond a single page.
+    """
+    headers = {"Authorization": f"Bearer {access_token}"}
+    base_url = "https://api.spotify.com/v1/me/player/recently-played"
+    items, seen_ids = [], set()
 
-def sp_fetch_recently_played(access_token: str, limit=50, pages=10):
-    items = []
-    url = "https://api.spotify.com/v1/me/player/recently-played"
-    headers = sp_get_headers(access_token)
-    params = {"limit": min(limit, 50)}
-    for _ in range(max(1, pages)):
-        r = requests.get(url, headers=headers, params=params, timeout=30)
+    # Cutoff in UTC (endpoint uses UTC ms)
+    cutoff = (now_local() - pd.Timedelta(days=days_back)).tz_convert("UTC")
+    cutoff_ms = int(cutoff.timestamp() * 1000)
+
+    before = None
+    while True:
+        params = {"limit": min(limit, 50)}
+        if before is not None:
+            params["before"] = before
+        r = requests.get(base_url, headers=headers, params=params, timeout=30)
         if r.status_code in (401, 403):
             try:
                 err = r.json()
@@ -76,14 +84,48 @@ def sp_fetch_recently_played(access_token: str, limit=50, pages=10):
             raise RuntimeError(f"Spotify API {r.status_code}: {err}")
         r.raise_for_status()
         data = r.json()
-        items.extend(data.get("items", []))
-        next_url = data.get("next")
-        if not next_url:
+        batch = data.get("items", [])
+        if not batch:
             break
-        url = next_url
-        params = {}
+
+        # Stop if we’ve reached past cutoff
+        oldest = batch[-1].get("played_at")
+        if oldest:
+            oldest_ms = int(pd.to_datetime(oldest, utc=True).timestamp() * 1000)
+            if oldest_ms < cutoff_ms:
+                # Keep only within window
+                def keep(b):
+                    ts = pd.to_datetime(b.get("played_at"), utc=True)
+                    return int(ts.timestamp() * 1000) >= cutoff_ms
+                batch = [b for b in batch if keep(b)]
+                if not batch:
+                    break
+
+        # de-dupe by item id if present, else by (played_at, track.id)
+        for it in batch:
+            pid = it.get("id") or (it.get("played_at"), (it.get("track") or {}).get("id"))
+            if pid in seen_ids:
+                continue
+            seen_ids.add(pid)
+            items.append(it)
+
+        # Move the cursor back
+        cursor = data.get("cursors", {})
+        before = cursor.get("before")
+        if not before:
+            nxt = data.get("next")
+            if not nxt:
+                break
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(nxt).query)
+            before = qs.get("before", [None])[0]
+            if not before:
+                break
+
     return items
 
+# =========================
+# Normalization + Enrichment
+# =========================
 def normalize_recently_played(items: list) -> pd.DataFrame:
     rows = []
     for it in items:
@@ -108,7 +150,7 @@ def normalize_recently_played(items: list) -> pd.DataFrame:
     if not df.empty and "played_at" in df.columns:
         # Parse as UTC then convert to local tz so dates/hours match your day
         df["played_at"] = pd.to_datetime(df["played_at"], utc=True).dt.tz_convert(TZ)
-        # Clip any accidental “future” timestamps (clock skew, etc.)
+        # Clip any accidental “future” timestamps
         df = df[df["played_at"] <= now_local()]
         # Derive local day/hour fields after conversion
         df["date"] = df["played_at"].dt.date
@@ -116,7 +158,6 @@ def normalize_recently_played(items: list) -> pd.DataFrame:
         df["weekday"] = df["played_at"].dt.day_name()
     return df
 
-# ------------------- Live helpers: sessions & enrich ---------------
 def chunked(iterable, size):
     it = iter(iterable)
     while True:
@@ -197,562 +238,266 @@ def sp_artists_genres(access_token, artist_ids):
                 rows.append({"artist_id": a.get("id"), "genre": g})
     return pd.DataFrame(rows)
 
-# =============================== UI ===============================
-st.title("🎧 Spotify Analytics")
+# =========================
+# UI — Live mode only
+# =========================
+st.title("🎧 Spotify Analytics (Live)")
 
-mode = st.radio("Mode", ["Demo mode", "Live mode (connect Spotify)"], horizontal=True)
+# Handle OAuth callback
+qp = st.query_params
+code = qp.get("code", [None])[0] if isinstance(qp.get("code"), list) else qp.get("code")
 
-# ---------------------------- Demo mode ---------------------------
-def get_table_columns(schema: str, table: str):
-    q = f"""
-    SELECT column_name
-    FROM information_schema.columns
-    WHERE table_schema = '{schema}'
-      AND table_name   = '{table}'
-    ORDER BY ordinal_position
-    """
+if "sp_access_token" not in st.session_state:
+    st.session_state.update(sp_access_token=None, sp_refresh_token=None, sp_token_expiry=0, sp_scope="")
+
+def need_refresh():
+    return time.time() > st.session_state.get("sp_token_expiry", 0) - 60
+
+# Exchange code → tokens
+if code and not st.session_state["sp_access_token"]:
     try:
-        df = read_sql(q)
-        return set(df["column_name"].str.lower().tolist())
-    except Exception:
-        return set()
-
-def plays_time_expr(cols: set) -> str:
-    if "played_at" in cols: return "played_at"
-    if "played_at_ts" in cols: return "played_at_ts"
-    return "dt"
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_kpis_demo(schema: str, start: str, end: str):
-    cols = get_table_columns(schema, "stg_spotify__plays")
-    tcol = plays_time_expr(cols)
-    if tcol in ("played_at", "played_at_ts"):
-        sql = f"""
-        WITH base AS (
-          SELECT {tcol} AS ts, track_id
-          FROM {schema}.stg_spotify__plays
-          WHERE DATE({tcol}) BETWEEN DATE '{start}' AND DATE '{end}'
-        ),
-        daily AS (
-          SELECT CAST(date(ts) AS date) AS dt,
-                 COUNT(*) AS plays,
-                 COUNT(DISTINCT track_id) AS unique_tracks
-          FROM base GROUP BY 1
-        )
-        SELECT
-          SUM(plays) AS total_plays,
-          SUM(unique_tracks) AS total_unique_tracks,
-          AVG(plays) AS avg_plays_per_day,
-          COUNT(*) AS active_days
-        FROM daily
-        """
-    else:
-        sql = f"""
-        WITH base AS (
-          SELECT dt, track_id
-          FROM {schema}.stg_spotify__plays
-          WHERE dt BETWEEN DATE '{start}' AND DATE '{end}'
-        ),
-        daily AS (
-          SELECT CAST(dt AS date) AS dt,
-                 COUNT(*) AS plays,
-                 COUNT(DISTINCT track_id) AS unique_tracks
-          FROM base GROUP BY 1
-        )
-        SELECT
-          SUM(plays) AS total_plays,
-          SUM(unique_tracks) AS total_unique_tracks,
-          AVG(plays) AS avg_plays_per_day,
-          COUNT(*) AS active_days
-        FROM daily
-        """
-    return read_sql(sql)
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_daily_demo(schema: str, start: str, end: str):
-    cols = get_table_columns(schema, "stg_spotify__plays")
-    tcol = plays_time_expr(cols)
-    if tcol in ("played_at", "played_at_ts"):
-        sql = f"""
-        SELECT CAST(date({tcol}) AS date) AS dt,
-               COUNT(*) AS plays,
-               COUNT(DISTINCT track_id) AS unique_tracks
-        FROM {schema}.stg_spotify__plays
-        WHERE DATE({tcol}) BETWEEN DATE '{start}' AND DATE '{end}'
-        GROUP BY 1
-        ORDER BY 1
-        """
-    else:
-        sql = f"""
-        SELECT CAST(dt AS date) AS dt,
-               COUNT(*) AS plays,
-               COUNT(DISTINCT track_id) AS unique_tracks
-        FROM {schema}.stg_spotify__plays
-        WHERE dt BETWEEN DATE '{start}' AND DATE '{end}'
-        GROUP BY 1
-        ORDER BY 1
-        """
-    return read_sql(sql)
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_top_tracks_demo(schema: str, start: str, end: str, limit: int):
-    cols = get_table_columns(schema, "stg_spotify__plays")
-    tcol = plays_time_expr(cols)
-    time_filter = (
-        f"DATE({tcol}) BETWEEN DATE '{start}' AND DATE '{end}'"
-        if tcol in ("played_at", "played_at_ts")
-        else f"dt BETWEEN DATE '{start}' AND DATE '{end}'"
-    )
-    # prefer joining to dim_tracks for names
-    try:
-        sql = f"""
-        SELECT p.track_id,
-               COALESCE(t.track_name, p.track_id) AS track_name,
-               COUNT(*) AS play_count
-        FROM {schema}.stg_spotify__plays p
-        LEFT JOIN {schema}.dim_tracks t ON p.track_id = t.track_id
-        WHERE {time_filter}
-        GROUP BY 1,2
-        ORDER BY play_count DESC
-        LIMIT {int(limit)}
-        """
-        df = read_sql(sql)
-        if not df.empty:
-            return df
-    except Exception:
-        pass
-    sql = f"""
-    SELECT track_id,
-           track_id AS track_name,
-           COUNT(*) AS play_count
-    FROM {schema}.stg_spotify__plays
-    WHERE {time_filter}
-    GROUP BY 1,2
-    ORDER BY play_count DESC
-    LIMIT {int(limit)}
-    """
-    return read_sql(sql)
-
-@st.cache_data(ttl=300, show_spinner=False)
-def load_sessions_demo(schema: str, start: str, end: str):
-    q_exists = f"""
-    SELECT 1
-    FROM information_schema.tables
-    WHERE table_schema = '{schema}'
-      AND table_name   = 'fct_listening_sessions'
-    LIMIT 1
-    """
-    ex = read_sql(q_exists)
-    if ex.empty:
-        return pd.DataFrame(columns=["session_id","session_start","session_end","track_plays","session_duration_seconds"])
-    sql = f"""
-    SELECT session_id, session_start, session_end, track_plays, session_duration_seconds
-    FROM {schema}.fct_listening_sessions
-    WHERE DATE(session_start) BETWEEN DATE '{start}' AND DATE '{end}'
-    ORDER BY session_start DESC
-    LIMIT 1000
-    """
-    return read_sql(sql)
-
-def demo_mode_ui():
-    st.subheader("🧪 Demo mode")
-    if not ATHENA_AVAILABLE:
-        st.warning("Demo mode unavailable: `athena.py` not found or import failed.")
-        return
-
-    # Determine broad bounds from data if possible (so pickers are always clickable)
-    try:
-        dd = read_sql(f"SELECT MIN(dt) AS min_dt, MAX(dt) AS max_dt FROM {SCHEMA}.stg_spotify__plays")
-        min_dt = pd.to_datetime(dd.iloc[0]["min_dt"]).date() if not dd.empty and dd.iloc[0]["min_dt"] else dt.date.today()
-        max_dt = pd.to_datetime(dd.iloc[0]["max_dt"]).date() if not dd.empty and dd.iloc[0]["max_dt"] else dt.date.today()
-    except Exception:
-        min_dt = dt.date.today()
-        max_dt = dt.date.today()
-
-    broad_min = (pd.to_datetime(min_dt) - pd.Timedelta(days=180)).date()
-    broad_max = max(dt.date.today(), max_dt)
-
-    col_a, col_b = st.columns([1, 1])
-    with col_a:
-        start = st.date_input("Start date", value=min_dt, min_value=broad_min, max_value=broad_max, key="demo_start")
-    with col_b:
-        end = st.date_input("End date", value=max_dt, min_value=broad_min, max_value=broad_max, key="demo_end")
-
-    s_str, e_str = str(start), str(end)
-
-    # KPIs
-    try:
-        kpis = load_kpis_demo(SCHEMA, s_str, e_str)
-        c1,c2,c3,c4 = st.columns(4)
-        if not kpis.empty:
-            r = kpis.iloc[0].fillna(0)
-            c1.metric("Total Plays", int(r.get("total_plays", 0) or 0))
-            c2.metric("Unique Tracks", int(r.get("total_unique_tracks", 0) or 0))
-            c3.metric("Avg Plays / Day", round(float(r.get("avg_plays_per_day", 0) or 0), 2))
-            c4.metric("Active Days", int(r.get("active_days", 0) or 0))
-        else:
-            st.info("No data for the selected range.")
+        tokens = sp_exchange_code_for_tokens(code)
+        st.session_state["sp_access_token"] = tokens["access_token"]
+        st.session_state["sp_refresh_token"] = tokens.get("refresh_token", st.session_state.get("sp_refresh_token"))
+        st.session_state["sp_token_expiry"] = time.time() + int(tokens.get("expires_in", 3600))
+        st.session_state["sp_scope"] = tokens.get("scope","")
+        st.success("Spotify authorized!")
+        st.caption(f"Granted scopes: {st.session_state['sp_scope']}")
+        st.query_params.clear()
     except Exception as e:
-        st.error("Failed to load KPIs.")
+        st.error("Failed to exchange Spotify code.")
         st.exception(e)
 
-    st.divider()
-
-    # Trends
-    try:
-        daily = load_daily_demo(SCHEMA, s_str, e_str)
-        left, right = st.columns([2, 1])
-        with left:
-            if not daily.empty:
-                chart = alt.Chart(daily).mark_line(point=True).encode(
-                    x=alt.X("dt:T", title="Date"),
-                    y=alt.Y("plays:Q", title="Plays"),
-                    tooltip=["dt:T", "plays:Q", "unique_tracks:Q"]
-                ).properties(height=280, title="Plays per day")
-                st.altair_chart(chart, use_container_width=True)
-
-                daily = daily.sort_values("dt").copy()
-                daily["cum_plays"] = daily["plays"].cumsum()
-                st.altair_chart(
-                    alt.Chart(daily).mark_line(point=True).encode(
-                        x="dt:T", y=alt.Y("cum_plays:Q", title="Cumulative plays"),
-                        tooltip=["dt:T","cum_plays:Q"]
-                    ).properties(height=220, title="Cumulative plays"),
-                    use_container_width=True
-                )
-            else:
-                st.info("No daily data yet.")
-        with right:
-            if not daily.empty:
-                st.dataframe(
-                    daily.rename(columns={"dt":"Date","plays":"Plays","unique_tracks":"Unique tracks"}),
-                    use_container_width=True, height=280
-                )
-    except Exception as e:
-        st.error("Failed to load daily series.")
-        st.exception(e)
-
-    st.divider()
-
-    # Top tracks
-    try:
-        tops = load_top_tracks_demo(SCHEMA, s_str, e_str, limit=15)
-        if not tops.empty:
-            st.altair_chart(
-                alt.Chart(tops).mark_bar().encode(
-                    x=alt.X("play_count:Q", title="Plays"),
-                    y=alt.Y("track_name:N", sort="-x", title="Track"),
-                    tooltip=["track_name:N","play_count:Q"]
-                ).properties(height=400, title="Top tracks"),
-                use_container_width=True
-            )
-            st.dataframe(tops, use_container_width=True, hide_index=True)
-        else:
-            st.info("No top tracks in this range.")
-    except Exception as e:
-        st.error("Failed to load top tracks.")
-        st.exception(e)
-
-    st.divider()
-
-    # Sessions
-    st.subheader("Recent listening sessions (30-min gaps)")
-    try:
-        sessions = load_sessions_demo(SCHEMA, s_str, e_str)
-        if not sessions.empty:
-            sessions = sessions.copy()
-            sessions["duration_min"] = (sessions["session_duration_seconds"].astype(float)/60).round(1)
-            st.dataframe(
-                sessions[["session_id","session_start","session_end","track_plays","duration_min"]],
-                use_container_width=True, hide_index=True
-            )
-        else:
-            st.info("No sessions found in this range.")
-    except Exception as e:
-        st.error("Failed to load sessions.")
-        st.exception(e)
-
-# ---------------------------- Live mode ---------------------------
-def fmt_pct(x):
-    try: return f"{x:+.0%}"
-    except Exception: return "—"
-
-def period_compare(df, start, end, prev_mode="previous"):
-    df = df.copy()
-    df["date"] = df["played_at"].dt.date
-    curr = df[(df["date"] >= start) & (df["date"] <= end)]
-    if prev_mode == "previous":
-        days = (end - start).days + 1
-        base_start = start - pd.Timedelta(days=days)
-        base_end   = start - pd.Timedelta(days=1)
-        base_label = f"Prev {days}d ({base_start} → {base_end})"
-    else:
-        ps, pe = prev_mode
-        base_start, base_end = ps, pe
-        base_label = f"Baseline ({ps} → {pe})"
-    base = df[(df["date"] >= base_start) & (df["date"] <= base_end)]
-    return curr, base, base_label
-
-def kpi_block(col, label, value, delta=None):
-    if delta is None: col.metric(label, value)
-    else: col.metric(label, value, delta=fmt_pct(delta))
-
-def live_mode_ui():
-    st.subheader("🔌 Live mode (connect your Spotify)")
-    qp = st.query_params
-    code = qp.get("code", [None])[0] if isinstance(qp.get("code"), list) else qp.get("code")
-
-    if "sp_access_token" not in st.session_state:
-        st.session_state.update(sp_access_token=None, sp_refresh_token=None, sp_token_expiry=0, sp_scope="")
-
-    def need_refresh():
-        return time.time() > st.session_state.get("sp_token_expiry", 0) - 60
-
-    if code and not st.session_state["sp_access_token"]:
-        try:
-            tokens = sp_exchange_code_for_tokens(code)
-            st.session_state["sp_access_token"] = tokens["access_token"]
-            st.session_state["sp_refresh_token"] = tokens.get("refresh_token", st.session_state.get("sp_refresh_token"))
-            st.session_state["sp_token_expiry"] = time.time() + int(tokens.get("expires_in", 3600))
-            st.session_state["sp_scope"] = tokens.get("scope","")
-            st.success("Spotify authorized!")
-            st.caption(f"Granted scopes: `{st.session_state['sp_scope']}`")
-            st.query_params.clear()
-        except Exception as e:
-            st.error("Failed to exchange Spotify code.")
-            st.exception(e)
-
-    c1,c2 = st.columns([1,1])
-    with c1:
-        if not st.session_state["sp_access_token"]:
-            if st.button("Connect Spotify"):
-                st.markdown(f"[Click here to authorize]({sp_auth_url()})")
-        else:
-            st.success("Connected to Spotify")
-            if st.session_state.get("sp_scope"):
-                st.caption(f"Scopes: `{st.session_state['sp_scope']}`")
-    with c2:
-        if st.session_state["sp_access_token"]:
-            if st.button("Disconnect"):
-                for k in ["sp_access_token","sp_refresh_token","sp_token_expiry","sp_scope"]:
-                    st.session_state.pop(k, None)
-                st.experimental_rerun()
-
+c1,c2 = st.columns([1,1])
+with c1:
     if not st.session_state["sp_access_token"]:
-        st.info("Connect Spotify to see your live analytics.")
-        return
+        if st.button("Connect Spotify"):
+            st.markdown(f"[Click here to authorize]({sp_auth_url()})")
+    else:
+        st.success("Connected to Spotify")
+        if st.session_state.get("sp_scope"):
+            st.caption(f"Scopes: {st.session_state['sp_scope']}")
+with c2:
+    if st.session_state["sp_access_token"]:
+        if st.button("Disconnect"):
+            for k in ["sp_access_token","sp_refresh_token","sp_token_expiry","sp_scope"]:
+                st.session_state.pop(k, None)
+            st.experimental_rerun()
 
-    if need_refresh() and st.session_state.get("sp_refresh_token"):
-        try:
-            rt = sp_refresh_access_token(st.session_state["sp_refresh_token"])
-            st.session_state["sp_access_token"] = rt["access_token"]
-            if "refresh_token" in rt:
-                st.session_state["sp_refresh_token"] = rt["refresh_token"]
-            st.session_state["sp_token_expiry"] = time.time() + int(rt.get("expires_in", 3600))
-            if "scope" in rt:
-                st.session_state["sp_scope"] = rt["scope"]
-        except Exception as e:
-            st.error("Token refresh failed; reconnect required.")
-            st.exception(e)
-            return
+if not st.session_state["sp_access_token"]:
+    st.info("Connect Spotify to see your analytics.")
+    st.stop()
 
-    # Fetch once, then filter by the single date range
+# Refresh token if needed
+if need_refresh() and st.session_state.get("sp_refresh_token"):
     try:
-        with st.spinner("Fetching your recent plays…"):
-            items = sp_fetch_recently_played(st.session_state["sp_access_token"], pages=10)
-            df = normalize_recently_played(items)
+        rt = sp_refresh_access_token(st.session_state["sp_refresh_token"])
+        st.session_state["sp_access_token"] = rt["access_token"]
+        if "refresh_token" in rt:
+            st.session_state["sp_refresh_token"] = rt["refresh_token"]
+        st.session_state["sp_token_expiry"] = time.time() + int(rt.get("expires_in", 3600))
+        if "scope" in rt:
+            st.session_state["sp_scope"] = rt["scope"]
     except Exception as e:
-        st.error("Could not fetch recently played.")
+        st.error("Token refresh failed; reconnect required.")
         st.exception(e)
-        st.info("Ensure your account is a tester (Dev mode) and scope `user-read-recently-played` is granted.")
-        return
+        st.stop()
 
-    if df.empty:
-        st.info("No recent plays returned by Spotify. Play something and refresh.")
-        return
+# How deep to fetch
+days_back = st.slider("History depth (days)", 1, 90, 30,
+                      help="How far back to fetch from Spotify’s 'Recently Played' endpoint.")
 
-    # Single date range for Live mode (local date bounds, relaxed)
-    min_data_date = pd.to_datetime(df["date"]).min().date()
-    max_data_date = pd.to_datetime(df["date"]).max().date()
-    broad_min = (pd.to_datetime(min_data_date) - pd.Timedelta(days=60)).date()
-    broad_max = max(now_local().date(), max_data_date)
+# Fetch & normalize
+try:
+    with st.spinner("Fetching your recent plays…"):
+        items = sp_fetch_recently_played(st.session_state["sp_access_token"], days_back=days_back)
+        df = normalize_recently_played(items)
+except Exception as e:
+    st.error("Could not fetch recently played.")
+    st.exception(e)
+    st.info("Ensure your account is a tester (Dev mode) and scope user-read-recently-played is granted.")
+    st.stop()
 
-    cA, cB = st.columns([1,1])
-    with cA:
-        s = st.date_input("Start", value=min_data_date, min_value=broad_min, max_value=broad_max, key="live_s")
-    with cB:
-        e = st.date_input("End", value=max_data_date, min_value=broad_min, max_value=broad_max, key="live_e")
+if df.empty:
+    st.info("No recent plays returned by Spotify. Play something and refresh.")
+    st.stop()
 
-    # Filter to range
-    curr = df[(df["date"] >= s) & (df["date"] <= e)].copy()
-    if curr.empty:
-        st.info("No plays in the selected range.")
-        return
+# Single date range (local)
+min_data_date = pd.to_datetime(df["date"]).min().date()
+max_data_date = pd.to_datetime(df["date"]).max().date()
+broad_min = (pd.to_datetime(min_data_date) - pd.Timedelta(days=60)).date()
+broad_max = max(now_local().date(), max_data_date)
 
-    # KPIs
-    by_day = curr.groupby("date").size()
-    total = len(curr)
-    uniq = curr["track_id"].nunique()
-    avg = by_day.mean() if not by_day.empty else 0
-    days = by_day.size
-    k1,k2,k3,k4 = st.columns(4)
-    k1.metric("Total Plays", total)
-    k2.metric("Unique Tracks", uniq)
-    k3.metric("Avg Plays / Day", round(avg,2))
-    k4.metric("Active Days", days)
+cA, cB = st.columns([1,1])
+with cA:
+    s = st.date_input("Start", value=min_data_date, min_value=broad_min, max_value=broad_max, key="live_s")
+with cB:
+    e = st.date_input("End", value=max_data_date, min_value=broad_min, max_value=broad_max, key="live_e")
 
-    st.divider()
-    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Trend", "Leaders", "Sessions", "Heatmaps", "Audio & Genres"])
+# Filter to picked range
+curr = df[(df["date"] >= s) & (df["date"] <= e)].copy()
+if curr.empty:
+    st.info("No plays in the selected range.")
+    st.stop()
 
-    # Trend
-    with tab1:
-        trend = curr.groupby("date").size().reset_index(name="plays").sort_values("date")
-        trend["roll7"] = trend["plays"].rolling(7, min_periods=1).mean()
-        tm = trend.melt(id_vars=["date"], value_vars=["plays","roll7"], var_name="series", value_name="value")
+# KPIs
+by_day = curr.groupby("date").size()
+total = len(curr)
+uniq = curr["track_id"].nunique()
+avg = by_day.mean() if not by_day.empty else 0
+days = by_day.size
+k1,k2,k3,k4 = st.columns(4)
+k1.metric("Total Plays", total)
+k2.metric("Unique Tracks", uniq)
+k3.metric("Avg Plays / Day", round(avg,2))
+k4.metric("Active Days", days)
+
+st.divider()
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["Trend", "Leaders", "Sessions", "Heatmaps", "Audio & Genres"])
+
+# Trend
+with tab1:
+    trend = curr.groupby("date").size().reset_index(name="plays").sort_values("date")
+    trend["roll7"] = trend["plays"].rolling(7, min_periods=1).mean()
+    tm = trend.melt(id_vars=["date"], value_vars=["plays","roll7"], var_name="series", value_name="value")
+    st.altair_chart(
+        alt.Chart(tm).mark_line(point=True).encode(
+            x=alt.X("date:T", title="Date"),
+            y=alt.Y("value:Q", title="Plays"),
+            color=alt.Color("series:N", title=""),
+            tooltip=["date:T","series:N","value:Q"]
+        ).properties(height=300, title="Daily plays (7-day rolling)"),
+        use_container_width=True
+    )
+    trend["cum_plays"] = trend["plays"].cumsum()
+    st.altair_chart(
+        alt.Chart(trend).mark_line(point=True).encode(
+            x="date:T",
+            y=alt.Y("cum_plays:Q", title="Cumulative plays"),
+            tooltip=["date:T","cum_plays:Q"]
+        ).properties(height=220, title="Cumulative plays"),
+        use_container_width=True
+    )
+
+# Leaders
+with tab2:
+    lt, la = st.columns(2)
+    top_tracks = curr.groupby(["track_id","track_name"], dropna=False).size().reset_index(name="play_count").sort_values("play_count", ascending=False).head(15)
+    top_artists = curr.groupby(["artist_id","artist_name"], dropna=False).size().reset_index(name="play_count").sort_values("play_count", ascending=False).head(15)
+    top_albums  = curr.groupby(["album_id","album_name"], dropna=False).size().reset_index(name="play_count").sort_values("play_count", ascending=False).head(15)
+
+    with lt:
         st.altair_chart(
-            alt.Chart(tm).mark_line(point=True).encode(
-                x=alt.X("date:T", title="Date"),
-                y=alt.Y("value:Q", title="Plays"),
-                color=alt.Color("series:N", title=""),
-                tooltip=["date:T","series:N","value:Q"]
-            ).properties(height=300, title="Daily plays (7-day rolling)"),
-            use_container_width=True
-        )
-        trend["cum_plays"] = trend["plays"].cumsum()
-        st.altair_chart(
-            alt.Chart(trend).mark_line(point=True).encode(
-                x="date:T",
-                y=alt.Y("cum_plays:Q", title="Cumulative plays"),
-                tooltip=["date:T","cum_plays:Q"]
-            ).properties(height=220, title="Cumulative plays"),
-            use_container_width=True
-        )
-
-    # Leaders
-    with tab2:
-        lt, la = st.columns(2)
-        top_tracks = curr.groupby(["track_id","track_name"], dropna=False).size().reset_index(name="play_count").sort_values("play_count", ascending=False).head(15)
-        top_artists = curr.groupby(["artist_id","artist_name"], dropna=False).size().reset_index(name="play_count").sort_values("play_count", ascending=False).head(15)
-        top_albums  = curr.groupby(["album_id","album_name"], dropna=False).size().reset_index(name="play_count").sort_values("play_count", ascending=False).head(15)
-
-        with lt:
-            st.altair_chart(
-                alt.Chart(top_tracks).mark_bar().encode(
-                    x=alt.X("play_count:Q", title="Plays"),
-                    y=alt.Y("track_name:N", sort="-x", title="Track"),
-                    tooltip=["track_name:N","play_count:Q"]
-                ).properties(height=380, title="Top tracks"),
-                use_container_width=True
-            )
-        with la:
-            st.altair_chart(
-                alt.Chart(top_artists).mark_bar().encode(
-                    x=alt.X("play_count:Q", title="Plays"),
-                    y=alt.Y("artist_name:N", sort="-x", title="Artist"),
-                    tooltip=["artist_name:N","play_count:Q"]
-                ).properties(height=380, title="Top artists"),
-                use_container_width=True
-            )
-        st.altair_chart(
-            alt.Chart(top_albums).mark_bar().encode(
+            alt.Chart(top_tracks).mark_bar().encode(
                 x=alt.X("play_count:Q", title="Plays"),
-                y=alt.Y("album_name:N", sort="-x", title="Album"),
-                tooltip=["album_name:N","play_count:Q"]
-            ).properties(height=320, title="Top albums"),
+                y=alt.Y("track_name:N", sort="-x", title="Track"),
+                tooltip=["track_name:N","play_count:Q"]
+            ).properties(height=380, title="Top tracks"),
             use_container_width=True
         )
-
-        # Diversity curve (filtered range, local time, no future rows)
-        curr_sorted = curr.sort_values("played_at").copy()
-        s_tracks = curr_sorted["track_id"].astype("string").fillna("__NULL__")
-        first_time = ~s_tracks.duplicated()
-        curr_sorted["cum_unique_tracks"] = first_time.cumsum()
-        cum = curr_sorted[["played_at","cum_unique_tracks"]]
+    with la:
         st.altair_chart(
-            alt.Chart(cum).mark_line().encode(
-                x=alt.X("played_at:T", title="Time"),
-                y=alt.Y("cum_unique_tracks:Q", title="Cumulative unique tracks"),
-                tooltip=["played_at:T","cum_unique_tracks:Q"]
-            ).properties(height=220, title="Discovery / diversity curve"),
+            alt.Chart(top_artists).mark_bar().encode(
+                x=alt.X("play_count:Q", title="Plays"),
+                y=alt.Y("artist_name:N", sort="-x", title="Artist"),
+                tooltip=["artist_name:N","play_count:Q"]
+            ).properties(height=380, title="Top artists"),
+            use_container_width=True
+        )
+    st.altair_chart(
+        alt.Chart(top_albums).mark_bar().encode(
+            x=alt.X("play_count:Q", title="Plays"),
+            y=alt.Y("album_name:N", sort="-x", title="Album"),
+            tooltip=["album_name:N","play_count:Q"]
+        ).properties(height=320, title="Top albums"),
+        use_container_width=True
+    )
+
+    # Diversity curve (no expanding.apply; robust to non-numeric)
+    curr_sorted = curr.sort_values("played_at").copy()
+    s_tracks = curr_sorted["track_id"].astype("string").fillna("_NULL_")
+    first_time = ~s_tracks.duplicated()
+    curr_sorted["cum_unique_tracks"] = first_time.cumsum()
+    cum = curr_sorted[["played_at","cum_unique_tracks"]]
+    st.altair_chart(
+        alt.Chart(cum).mark_line().encode(
+            x=alt.X("played_at:T", title="Time"),
+            y=alt.Y("cum_unique_tracks:Q", title="Cumulative unique tracks"),
+            tooltip=["played_at:T","cum_unique_tracks:Q"]
+        ).properties(height=220, title="Discovery / diversity curve"),
+        use_container_width=True
+    )
+
+# Sessions
+with tab3:
+    gap = st.slider("Session gap (minutes)", 10, 90, 30, step=5)
+    sessions = make_sessions(curr, gap_minutes=gap)
+    if sessions.empty:
+        st.info("No sessions in this range.")
+    else:
+        cA,cB,cC = st.columns(3)
+        cA.metric("Sessions", len(sessions))
+        cB.metric("Avg duration (min)", round(sessions["session_duration_seconds"].mean()/60, 1))
+        cC.metric("Max tracks in a session", int(sessions["track_plays"].max()))
+        st.dataframe(sessions, use_container_width=True, hide_index=True)
+        st.altair_chart(
+            alt.Chart(sessions.assign(duration_min=sessions["session_duration_seconds"]/60)).mark_bar().encode(
+                x=alt.X("duration_min:Q", bin=alt.Bin(maxbins=30), title="Duration (min)"),
+                y=alt.Y("count()", title="Sessions")
+            ).properties(height=240, title="Session duration distribution"),
             use_container_width=True
         )
 
-    # Sessions
-    with tab3:
-        gap = st.slider("Session gap (minutes)", 10, 90, 30, step=5)
-        sessions = make_sessions(curr, gap_minutes=gap)
-        if sessions.empty:
-            st.info("No sessions in this range.")
-        else:
-            cA,cB,cC = st.columns(3)
-            cA.metric("Sessions", len(sessions))
-            cB.metric("Avg duration (min)", round(sessions["session_duration_seconds"].mean()/60, 1))
-            cC.metric("Max tracks in a session", int(sessions["track_plays"].max()))
-            st.dataframe(sessions, use_container_width=True, hide_index=True)
+# Heatmaps
+with tab4:
+    weekday_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+    # Build full 24x7 grid
+    full = (
+        pd.MultiIndex.from_product([weekday_order, list(range(24))], names=["weekday","hour"])
+        .to_frame(index=False)
+    )
+    # Actual counts from current selection
+    heat_actual = curr.groupby(["weekday","hour"]).size().reset_index(name="plays")
+    # Merge → fill missing combos with 0
+    heat = full.merge(heat_actual, on=["weekday","hour"], how="left").fillna({"plays": 0})
+    heat["weekday"] = pd.Categorical(heat["weekday"], categories=weekday_order, ordered=True)
+
+    st.altair_chart(
+        alt.Chart(heat).mark_rect().encode(
+            x=alt.X("hour:O", title="Hour of day"),
+            y=alt.Y("weekday:O", title="Weekday", sort=weekday_order),
+            color=alt.Color("plays:Q", title="Plays"),
+            tooltip=["weekday:O","hour:O","plays:Q"]
+        ).properties(height=260, title="Listening intensity by weekday & hour"),
+        use_container_width=True
+    )
+
+# Audio & Genres (optional)
+with tab5:
+    enrich = st.checkbox("Enrich with audio features & genres (slower, extra API calls)", value=False)
+    if enrich:
+        with st.spinner("Fetching audio features…"):
+            feats = sp_audio_features(st.session_state["sp_access_token"], curr["track_id"].dropna().unique().tolist())
+        if not feats.empty:
+            merged = curr.merge(feats, on="track_id", how="left")
             st.altair_chart(
-                alt.Chart(sessions.assign(duration_min=sessions["session_duration_seconds"]/60)).mark_bar().encode(
-                    x=alt.X("duration_min:Q", bin=alt.Bin(maxbins=30), title="Duration (min)"),
-                    y=alt.Y("count()", title="Sessions")
-                ).properties(height=240, title="Session duration distribution"),
+                alt.Chart(merged.dropna(subset=["danceability","energy"])).mark_circle(size=60).encode(
+                    x=alt.X("danceability:Q", title="Danceability"),
+                    y=alt.Y("energy:Q", title="Energy"),
+                    tooltip=["track_name:N","artist_name:N","danceability:Q","energy:Q"]
+                ).properties(height=300, title="Danceability vs Energy"),
                 use_container_width=True
             )
-
-    # Heatmaps
-    with tab4:
-        weekday_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
-        # Build a full 24x7 frame
-        full = (
-            pd.MultiIndex.from_product([weekday_order, list(range(24))], names=["weekday","hour"])
-            .to_frame(index=False)
-        )
-        # Actual counts from current selection
-        heat_actual = curr.groupby(["weekday","hour"]).size().reset_index(name="plays")
-        # Merge → fill missing combos with 0
-        heat = full.merge(heat_actual, on=["weekday","hour"], how="left").fillna({"plays": 0})
-        heat["weekday"] = pd.Categorical(heat["weekday"], categories=weekday_order, ordered=True)
-
-        st.altair_chart(
-            alt.Chart(heat).mark_rect().encode(
-                x=alt.X("hour:O", title="Hour of day"),
-                y=alt.Y("weekday:O", title="Weekday", sort=weekday_order),
-                color=alt.Color("plays:Q", title="Plays"),
-                tooltip=["weekday:O","hour:O","plays:Q"]
-            ).properties(height=260, title="Listening intensity by weekday & hour"),
-            use_container_width=True
-        )
-
-    # Audio & Genres (optional extra calls)
-    with tab5:
-        enrich = st.checkbox("Enrich with audio features & genres (slower, extra API calls)", value=False)
-        if enrich:
-            with st.spinner("Fetching audio features…"):
-                feats = sp_audio_features(st.session_state["sp_access_token"], curr["track_id"].dropna().unique().tolist())
-            if not feats.empty:
-                merged = curr.merge(feats, on="track_id", how="left")
-                st.altair_chart(
-                    alt.Chart(merged.dropna(subset=["danceability","energy"])).mark_circle(size=60).encode(
-                        x=alt.X("danceability:Q", title="Danceability"),
-                        y=alt.Y("energy:Q", title="Energy"),
-                        tooltip=["track_name:N","artist_name:N","danceability:Q","energy:Q"]
-                    ).properties(height=300, title="Danceability vs Energy"),
-                    use_container_width=True
-                )
-            with st.spinner("Fetching artist genres…"):
-                gdf = sp_artists_genres(st.session_state["sp_access_token"], curr["artist_id"].dropna().unique().tolist())
-            if not gdf.empty:
-                top_genres = gdf["genre"].value_counts().reset_index()
-                top_genres.columns = ["genre","count"]
-                st.altair_chart(
-                    alt.Chart(top_genres.head(20)).mark_bar().encode(
-                        x=alt.X("count:Q", title="Count"),
-                        y=alt.Y("genre:N", sort="-x", title="Genre"),
-                        tooltip=["genre:N","count:Q"]
-                    ).properties(height=400, title="Top genres"),
-                    use_container_width=True
-                )
-
-# ----------------------------- Router -----------------------------
-if mode == "Demo mode":
-    demo_mode_ui()
-else:
-    live_mode_ui()
+        with st.spinner("Fetching artist genres…"):
+            gdf = sp_artists_genres(st.session_state["sp_access_token"], curr["artist_id"].dropna().unique().tolist())
+        if not gdf.empty:
+            top_genres = gdf["genre"].value_counts().reset_index()
+            top_genres.columns = ["genre","count"]
+            st.altair_chart(
+                alt.Chart(top_genres.head(20)).mark_bar().encode(
+                    x=alt.X("count:Q", title="Count"),
+                    y=alt.Y("genre:N", sort="-x", title="Genre"),
+                    tooltip=["genre:N","count:Q"]
+                ).properties(height=400, title="Top genres"),
+                use_container_width=True
+            )
