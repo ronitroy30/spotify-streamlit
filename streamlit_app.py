@@ -282,7 +282,11 @@ with c2:
         if st.button("Disconnect"):
             for k in ["sp_access_token","sp_refresh_token","sp_token_expiry","sp_scope"]:
                 st.session_state.pop(k, None)
-            st.experimental_rerun()
+            try:
+               st.query_params.clear()
+            except Exception:
+                 pass
+            st.rerun()
 
 if not st.session_state["sp_access_token"]:
     st.info("Connect Spotify to see your analytics.")
