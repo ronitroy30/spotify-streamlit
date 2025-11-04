@@ -784,7 +784,7 @@ def athena_mode_ui():
 
     # KPIs
     try:
-        kpis = load_kpis(start, end, dedupe)
+        kpis = load_kpis(start, end)
         c1, c2, c3, c4 = st.columns(4)
         if not kpis.empty:
             r = kpis.iloc[0].fillna(0)
@@ -794,7 +794,7 @@ def athena_mode_ui():
             c4.metric("Active Days", int(r.get("active_days", 0) or 0))
             # Top track caption
             try:
-                tops_for_caption = load_top_tracks(start, end, dedupe, limit=1)
+                tops_for_caption = load_top_tracks(start, end, limit=1)
                 if not tops_for_caption.empty:
                     top = tops_for_caption.iloc[0]
                     st.caption(f"Top track: **{top['track_name']}** ({int(top['play_count'])} plays)")
@@ -812,7 +812,7 @@ def athena_mode_ui():
 
     # Trends
     try:
-        daily = load_daily_series(start, end, dedupe)
+        daily = load_daily_series(start, end)
         left, right = st.columns([2, 1])
         with left:
             if not daily.empty:
@@ -839,7 +839,7 @@ def athena_mode_ui():
 
     # Top tracks
     try:
-        tops = load_top_tracks(start, end, dedupe, limit=15)
+        tops = load_top_tracks(start, end, limit=15)
         if not tops.empty:
             bars = alt.Chart(tops).mark_bar().encode(
                 x=alt.X("play_count:Q", title="Plays"),
