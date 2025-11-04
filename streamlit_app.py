@@ -228,7 +228,7 @@ def live_mode_ui():
 
 # ====== Toggle between your AWS-backed dashboard and Live mode ======
 st.divider()
-mode = st.radio("Mode", ["Athena (your warehouse)", "Live mode (user connects Spotify)"], horizontal=True)
+mode = st.radio("Mode", ["Demo mode", "Live mode (user connects Spotify)"], horizontal=True)
 if mode == "Live mode (user connects Spotify)":
     live_mode_ui()
     st.stop()
