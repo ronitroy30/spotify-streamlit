@@ -880,7 +880,7 @@ def athena_mode_ui():
 #                              MODE TOGGLE & ROUTER
 # ============================================================================
 
-mode = st.radio("Mode", ["Live mode (user connects Spotify)", "Athena (your warehouse)"], horizontal=True)
+mode = st.radio("Mode", ["Live mode (user connects Spotify)", "Demo mode"], horizontal=True)
 
 if mode == "Live mode (user connects Spotify)":
     live_mode_ui()
