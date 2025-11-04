@@ -23,18 +23,22 @@ def now_local():
 # =========================
 # Spotify OAuth helpers
 # =========================
-def sp_auth_url():
+import secrets
+
+def sp_auth_url(force_dialog: bool = True):
     client_id = st.secrets["SPOTIFY_CLIENT_ID"]
     redirect_uri = st.secrets["SPOTIFY_REDIRECT_URI"]
     scopes = st.secrets.get("SPOTIFY_SCOPES", "user-read-recently-played")
-    state = str(int(time.time()))
+    state = secrets.token_urlsafe(24)  # fresh state each time
+
     params = {
         "client_id": client_id,
         "response_type": "code",
         "redirect_uri": redirect_uri,
         "scope": scopes,
         "state": state,
-        "show_dialog": "false",
+        # key bit ↓
+        "show_dialog": "true" if force_dialog else "false",
     }
     return "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode(params)
 
@@ -268,25 +272,29 @@ if code and not st.session_state["sp_access_token"]:
         st.error("Failed to exchange Spotify code.")
         st.exception(e)
 
-c1,c2 = st.columns([1,1])
+c1, c2 = st.columns([1,1])
 with c1:
     if not st.session_state["sp_access_token"]:
         if st.button("Connect Spotify"):
-            st.markdown(f"[Click here to authorize]({sp_auth_url()})")
+            st.query_params.clear()
+            st.markdown(f"[Authorize Spotify]({sp_auth_url(force_dialog=False)})")
     else:
         st.success("Connected to Spotify")
         if st.session_state.get("sp_scope"):
             st.caption(f"Scopes: {st.session_state['sp_scope']}")
+
 with c2:
     if st.session_state["sp_access_token"]:
         if st.button("Disconnect"):
             for k in ["sp_access_token","sp_refresh_token","sp_token_expiry","sp_scope"]:
                 st.session_state.pop(k, None)
-            try:
-               st.query_params.clear()
-            except Exception:
-                 pass
+            st.query_params.clear()
             st.rerun()
+    else:
+        # Always show the re-consent dialog so you can pick a different account
+        if st.button("Connect a different Spotify account"):
+            st.query_params.clear()
+            st.markdown(f"[Authorize as different user]({sp_auth_url(force_dialog=True)})")
 
 if not st.session_state["sp_access_token"]:
     st.info("Connect Spotify to see your analytics.")
