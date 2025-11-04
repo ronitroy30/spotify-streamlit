@@ -423,6 +423,25 @@ def live_mode_ui():
         # Diversity curve
         curr_sorted = curr.sort_values("played_at").copy()
         if not curr_sorted.empty:
+            s = curr_sorted["track_id"].astype(str).fillna("__NULL__")
+            first_time = ~s.duplicated()
+    # Cumulative count of first occurrences = cumulative uniques
+            curr_sorted["cum_unique_tracks"] = first_time.cumsum()
+            cum = curr_sorted[["played_at", "cum_unique_tracks"]].copy()
+            st.altair_chart(
+              alt.Chart(cum).mark_line().encode(
+                x=alt.X("played_at:T", title="Time"),
+                y=alt.Y("cum_unique_tracks:Q", title="Cumulative unique tracks"),
+                tooltip=["played_at:T", "cum_unique_tracks:Q"]
+             ).properties(height=220, title="Discovery / diversity curve"),
+           use_container_width=True
+           )
+
+
+
+        
+        curr_sorted = curr.sort_values("played_at").copy()
+        if not curr_sorted.empty:
             curr_sorted["cum_unique_tracks"] = curr_sorted["track_id"].expanding().apply(lambda s: len(set(s)), raw=False)
             cum = curr_sorted[["played_at","cum_unique_tracks"]].copy()
             st.altair_chart(
