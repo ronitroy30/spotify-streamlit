@@ -3,6 +3,7 @@ import time
 import itertools
 import urllib.parse
 import datetime as dt
+
 import pandas as pd
 import requests
 import streamlit as st
@@ -12,6 +13,11 @@ from dateutil.relativedelta import relativedelta
 # ----------------------------- Config -----------------------------
 st.set_page_config(page_title="Spotify Analytics — Demo + Live", layout="wide")
 SCHEMA = st.secrets.get("ATHENA_SCHEMA", os.getenv("ATHENA_SCHEMA", "spotify_analytics"))
+
+# Local timezone for display and day boundaries
+TZ = "America/New_York"
+def now_local():
+    return pd.Timestamp.now(tz=TZ)
 
 # Optional Athena helper (demo mode). App still runs if missing.
 try:
@@ -100,7 +106,11 @@ def normalize_recently_played(items: list) -> pd.DataFrame:
         })
     df = pd.DataFrame(rows)
     if not df.empty and "played_at" in df.columns:
-        df["played_at"] = pd.to_datetime(df["played_at"])
+        # Parse as UTC then convert to local tz so dates/hours match your day
+        df["played_at"] = pd.to_datetime(df["played_at"], utc=True).dt.tz_convert(TZ)
+        # Clip any accidental “future” timestamps (clock skew, etc.)
+        df = df[df["played_at"] <= now_local()]
+        # Derive local day/hour fields after conversion
         df["date"] = df["played_at"].dt.date
         df["hour"] = df["played_at"].dt.hour
         df["weekday"] = df["played_at"].dt.day_name()
@@ -135,7 +145,14 @@ def sp_audio_features(access_token, track_ids):
         return pd.DataFrame()
     headers = {"Authorization": f"Bearer {access_token}"}
     rows = []
-    for batch in chunked(list(dict.fromkeys(track_ids)), 100):
+    # dedup while preserving order
+    seen = set()
+    de_duped = []
+    for t in track_ids:
+        if t and t not in seen:
+            seen.add(t)
+            de_duped.append(t)
+    for batch in chunked(de_duped, 100):
         r = requests.get("https://api.spotify.com/v1/audio-features",
                          headers=headers, params={"ids": ",".join(batch)}, timeout=30)
         if r.status_code in (401, 403):
@@ -162,7 +179,14 @@ def sp_artists_genres(access_token, artist_ids):
         return pd.DataFrame(columns=["artist_id","genre"])
     headers = {"Authorization": f"Bearer {access_token}"}
     rows = []
-    for batch in chunked(list(dict.fromkeys(artist_ids)), 50):
+    # dedup while preserving order
+    seen = set()
+    de_duped = []
+    for a in artist_ids:
+        if a and a not in seen:
+            seen.add(a)
+            de_duped.append(a)
+    for batch in chunked(de_duped, 50):
         r = requests.get("https://api.spotify.com/v1/artists",
                          headers=headers, params={"ids": ",".join(batch)}, timeout=30)
         if r.status_code in (401,403):
@@ -198,7 +222,6 @@ def plays_time_expr(cols: set) -> str:
     if "played_at_ts" in cols: return "played_at_ts"
     return "dt"
 
-# Cache loaders with explicit keys that include date range (as strings)
 @st.cache_data(ttl=300, show_spinner=False)
 def load_kpis_demo(schema: str, start: str, end: str):
     cols = get_table_columns(schema, "stg_spotify__plays")
@@ -337,16 +360,24 @@ def demo_mode_ui():
         st.warning("Demo mode unavailable: `athena.py` not found or import failed.")
         return
 
-    # Single date range (this is the only one shown in Demo mode)
-    default_end = dt.date.today()
-    default_start = default_end - relativedelta(months=1)
+    # Determine broad bounds from data if possible (so pickers are always clickable)
+    try:
+        dd = read_sql(f"SELECT MIN(dt) AS min_dt, MAX(dt) AS max_dt FROM {SCHEMA}.stg_spotify__plays")
+        min_dt = pd.to_datetime(dd.iloc[0]["min_dt"]).date() if not dd.empty and dd.iloc[0]["min_dt"] else dt.date.today()
+        max_dt = pd.to_datetime(dd.iloc[0]["max_dt"]).date() if not dd.empty and dd.iloc[0]["max_dt"] else dt.date.today()
+    except Exception:
+        min_dt = dt.date.today()
+        max_dt = dt.date.today()
+
+    broad_min = (pd.to_datetime(min_dt) - pd.Timedelta(days=180)).date()
+    broad_max = max(dt.date.today(), max_dt)
+
     col_a, col_b = st.columns([1, 1])
     with col_a:
-        start = st.date_input("Start date", value=default_start, key="demo_start")
+        start = st.date_input("Start date", value=min_dt, min_value=broad_min, max_value=broad_max, key="demo_start")
     with col_b:
-        end = st.date_input("End date", value=default_end, key="demo_end")
+        end = st.date_input("End date", value=max_dt, min_value=broad_min, max_value=broad_max, key="demo_end")
 
-    # Normalize to strings for caching + SQL
     s_str, e_str = str(start), str(end)
 
     # KPIs
@@ -468,7 +499,6 @@ def kpi_block(col, label, value, delta=None):
 
 def live_mode_ui():
     st.subheader("🔌 Live mode (connect your Spotify)")
-    # One (and only one) date range picker inside Live mode
     qp = st.query_params
     code = qp.get("code", [None])[0] if isinstance(qp.get("code"), list) else qp.get("code")
 
@@ -541,13 +571,17 @@ def live_mode_ui():
         st.info("No recent plays returned by Spotify. Play something and refresh.")
         return
 
-    # Single date range for Live mode
-    min_d, max_d = df["date"].min(), df["date"].max()
+    # Single date range for Live mode (local date bounds, relaxed)
+    min_data_date = pd.to_datetime(df["date"]).min().date()
+    max_data_date = pd.to_datetime(df["date"]).max().date()
+    broad_min = (pd.to_datetime(min_data_date) - pd.Timedelta(days=60)).date()
+    broad_max = max(now_local().date(), max_data_date)
+
     cA, cB = st.columns([1,1])
     with cA:
-        s = st.date_input("Start", value=min_d, min_value=min_d, max_value=max_d, key="live_s")
+        s = st.date_input("Start", value=min_data_date, min_value=broad_min, max_value=broad_max, key="live_s")
     with cB:
-        e = st.date_input("End", value=max_d, min_value=min_d, max_value=max_d, key="live_e")
+        e = st.date_input("End", value=max_data_date, min_value=broad_min, max_value=broad_max, key="live_e")
 
     # Filter to range
     curr = df[(df["date"] >= s) & (df["date"] <= e)].copy()
@@ -628,7 +662,7 @@ def live_mode_ui():
             use_container_width=True
         )
 
-        # Diversity curve (no expanding.apply on strings)
+        # Diversity curve (filtered range, local time, no future rows)
         curr_sorted = curr.sort_values("played_at").copy()
         s_tracks = curr_sorted["track_id"].astype("string").fillna("__NULL__")
         first_time = ~s_tracks.duplicated()
@@ -655,12 +689,28 @@ def live_mode_ui():
             cB.metric("Avg duration (min)", round(sessions["session_duration_seconds"].mean()/60, 1))
             cC.metric("Max tracks in a session", int(sessions["track_plays"].max()))
             st.dataframe(sessions, use_container_width=True, hide_index=True)
+            st.altair_chart(
+                alt.Chart(sessions.assign(duration_min=sessions["session_duration_seconds"]/60)).mark_bar().encode(
+                    x=alt.X("duration_min:Q", bin=alt.Bin(maxbins=30), title="Duration (min)"),
+                    y=alt.Y("count()", title="Sessions")
+                ).properties(height=240, title="Session duration distribution"),
+                use_container_width=True
+            )
 
     # Heatmaps
     with tab4:
-        heat = curr.groupby(["weekday","hour"]).size().reset_index(name="plays")
         weekday_order = ["Monday","Tuesday","Wednesday","Thursday","Friday","Saturday","Sunday"]
+        # Build a full 24x7 frame
+        full = (
+            pd.MultiIndex.from_product([weekday_order, list(range(24))], names=["weekday","hour"])
+            .to_frame(index=False)
+        )
+        # Actual counts from current selection
+        heat_actual = curr.groupby(["weekday","hour"]).size().reset_index(name="plays")
+        # Merge → fill missing combos with 0
+        heat = full.merge(heat_actual, on=["weekday","hour"], how="left").fillna({"plays": 0})
         heat["weekday"] = pd.Categorical(heat["weekday"], categories=weekday_order, ordered=True)
+
         st.altair_chart(
             alt.Chart(heat).mark_rect().encode(
                 x=alt.X("hour:O", title="Hour of day"),
